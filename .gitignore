@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.zip
+output/
+work/
