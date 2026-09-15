@@ -11,11 +11,13 @@ APP_NAME='VideoLabs Worker'
 ROOT=Path(os.getenv('VIDEOLABS_TMP',tempfile.gettempdir()))/'videolabs'; ROOT.mkdir(parents=True,exist_ok=True)
 MAX_COMBINATIONS=int(os.getenv('MAX_COMBINATIONS','625')); JOB_TTL_SECONDS=int(os.getenv('JOB_TTL_SECONDS','7200'))
 TARGET_FPS=30; FFMPEG=imageio_ffmpeg.get_ffmpeg_exe()
+COPY_CODECS=('h264','avc1','hevc','h265')
 PROFILES={
-    'high':{'width':1080,'height':1920,'crf':'21','audio':'128k','label':'1080p Alta'},
-    'fast':{'width':720,'height':1280,'crf':'23','audio':'112k','label':'720p Rápida'},
+    'camera4k':{'width':2160,'height':3840,'crf':'18','audio':'192k','label':'4K Câmera','threads':'1'},
+    'high':{'width':1080,'height':1920,'crf':'21','audio':'128k','label':'1080p Alta','threads':'2'},
+    'fast':{'width':720,'height':1280,'crf':'23','audio':'112k','label':'720p Rápida','threads':'2'},
 }
-app=FastAPI(title=APP_NAME,version='0.6.0')
+app=FastAPI(title=APP_NAME,version='0.7.0')
 app.add_middleware(CORSMiddleware,allow_origins=['https://videolabs.vercel.app','http://localhost:5173'],allow_origin_regex=r'https://.*\.vercel\.app',allow_credentials=False,allow_methods=['*'],allow_headers=['*'])
 jobs={}; lock=threading.Lock(); executor=ThreadPoolExecutor(max_workers=1)
 
@@ -52,10 +54,9 @@ def public_job(i):
     with lock:j=jobs.get(i)
     if not j:j=restore_job(i)
     if not j:raise HTTPException(404,'Job não encontrado ou expirado.')
-    return {'id':i,'status':j['status'],'phase':j.get('phase',''),'progress':j.get('progress',0),'total':j.get('total',0),'percent':round(j.get('overall_percent',0),1),'error':j.get('error'),'quality':j.get('quality','high'),'created_at':j['created_at'],'expires_at':j['created_at']+JOB_TTL_SECONDS,'download_url':f'/v1/jobs/{i}/download' if j['status']=='ready' else None}
+    return {'id':i,'status':j['status'],'phase':j.get('phase',''),'progress':j.get('progress',0),'total':j.get('total',0),'percent':round(j.get('overall_percent',0),1),'error':j.get('error'),'quality':j.get('quality','camera4k'),'created_at':j['created_at'],'expires_at':j['created_at']+JOB_TTL_SECONDS,'download_url':f'/v1/jobs/{i}/download' if j['status']=='ready' else None}
 
 def run(args):
-    # Keep filters conservative on the 512 MB free instance. Encoder threads are capped separately.
     full=[FFMPEG,'-hide_banner','-loglevel','error','-filter_threads','1']+args
     r=subprocess.run(full,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     if r.returncode:
@@ -70,33 +71,44 @@ def probe(p):
 def exact_compatible(ps):
     if not ps or any(not p[0] for p in ps):return False
     first=ps[0]
-    return all(p==first for p in ps) and first[0] in ('h264','avc1') and first[6]
+    return all(p==first for p in ps) and first[0] in COPY_CODECS and first[6]
 
 def video_compatible(ps):
     if not ps or any(not p[0] for p in ps):return False
     first=ps[0]
     base=first[:4]
-    return first[0] in ('h264','avc1') and all(p[:4]==base for p in ps)
+    return first[0] in COPY_CODECS and all(p[:4]==base for p in ps)
 
 def has_audio(p):
     return b'Audio:' in subprocess.run([FFMPEG,'-hide_banner','-threads','1','-i',str(p)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE).stderr
 
-def normalize(src,dst,quality):
-    q=PROFILES.get(quality,PROFILES['high'])
-    vf=f"scale={q['width']}:{q['height']}:force_original_aspect_ratio=decrease:flags=bilinear,pad={q['width']}:{q['height']}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={TARGET_FPS}"
+def target_dimensions(quality,reference):
+    q=PROFILES.get(quality,PROFILES['camera4k'])
+    w,h=q['width'],q['height']
+    if reference and reference[1]>reference[2]:
+        return h,w
+    return w,h
+
+def normalize(src,dst,quality,reference=None):
+    q=PROFILES.get(quality,PROFILES['camera4k'])
+    width,height=target_dimensions(quality,reference)
+    scaler='lanczos' if quality in ('camera4k','high') else 'bilinear'
+    vf=f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags={scaler},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={TARGET_FPS}"
     args=['-y','-i',str(src)]
-    enc=['-vf',vf,'-c:v','libx264','-preset','ultrafast','-crf',q['crf'],'-pix_fmt','yuv420p','-threads','2','-c:a','aac','-b:a',q['audio'],'-ar','48000','-ac','2','-movflags','+faststart']
+    enc=['-vf',vf,'-c:v','libx264','-preset','ultrafast','-crf',q['crf'],'-pix_fmt','yuv420p','-threads',q.get('threads','1'),'-c:a','aac','-b:a',q['audio'],'-ar','48000','-ac','2','-movflags','+faststart']
+    if quality=='camera4k': enc[enc.index('-crf'):enc.index('-crf')]=['-tune','zerolatency']
     if has_audio(src):
         args+=enc+[str(dst)]
     else:
         args+=['-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=48000','-map','0:v:0','-map','1:a:0','-shortest']+enc+[str(dst)]
     run(args)
 
-def normalize_audio_only(src,dst):
+def normalize_audio_only(src,dst,quality):
+    audio=PROFILES.get(quality,PROFILES['camera4k'])['audio']
     if has_audio(src):
-        run(['-y','-i',str(src),'-c:v','copy','-c:a','aac','-b:a','128k','-ar','48000','-ac','2','-movflags','+faststart',str(dst)])
+        run(['-y','-i',str(src),'-c:v','copy','-c:a','aac','-b:a',audio,'-ar','48000','-ac','2','-movflags','+faststart',str(dst)])
     else:
-        run(['-y','-i',str(src),'-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=48000','-map','0:v:0','-map','1:a:0','-shortest','-c:v','copy','-c:a','aac','-b:a','128k','-ar','48000','-ac','2','-movflags','+faststart',str(dst)])
+        run(['-y','-i',str(src),'-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=48000','-map','0:v:0','-map','1:a:0','-shortest','-c:v','copy','-c:a','aac','-b:a',audio,'-ar','48000','-ac','2','-movflags','+faststart',str(dst)])
 
 def concat(combo,out):
     lf=out.with_suffix('.txt'); lf.write_text('\n'.join("file '"+str(item['path'].resolve()).replace("'","'\\''")+"'" for item in combo)+'\n')
@@ -104,7 +116,7 @@ def concat(combo,out):
     finally: lf.unlink(missing_ok=True)
 
 def download(url,target):
-    req=urllib.request.Request(url,headers={'User-Agent':'VideoLabs/0.6'}); total=0
+    req=urllib.request.Request(url,headers={'User-Agent':'VideoLabs/0.7'}); total=0
     with urllib.request.urlopen(req,timeout=180) as r,target.open('wb') as f:
         while True:
             b=r.read(256*1024)
@@ -123,7 +135,7 @@ def process_job(i):
     with lock:
         j=jobs.get(i)
         if not j:return
-        wd=Path(j['workdir']); stages=j['stages']; mode=j['mode']; requested=j['requested']; quality=j.get('quality','high')
+        wd=Path(j['workdir']); stages=j['stages']; mode=j['mode']; requested=j['requested']; quality=j.get('quality','camera4k')
     try:
         inputs=wd/'inputs'; prepared=wd/'prepared'
         shutil.rmtree(inputs,ignore_errors=True); shutil.rmtree(prepared,ignore_errors=True)
@@ -131,7 +143,6 @@ def process_job(i):
         (wd/'VideoLabs-resultados.zip').unlink(missing_ok=True)
         inputs.mkdir(exist_ok=True); prepared.mkdir(exist_ok=True)
         set_job(i,status='processing',phase='Preparando processamento',error=None,progress=0,overall_percent=1)
-
         raw=[]; n=sum(len(s['files']) for s in stages); done=0
         for si,s in enumerate(stages):
             arr=[]
@@ -142,68 +153,52 @@ def process_job(i):
                 arr.append({'path':src,'label':safe_name(f.get('label') or f"{safe_name(s.get('name','V'))}{fi+1}"),'original_name':f.get('name','video.mp4')})
                 done+=1
             raw.append(arr)
-
         flat=[item for a in raw for item in a]
-        set_job(i,phase='Verificando compatibilidade',overall_percent=20)
+        set_job(i,phase='Verificando compatibilidade 4K',overall_percent=20)
         ps=[probe(item['path']) for item in flat]
+        reference=ps[0] if ps else None
         exact=exact_compatible(ps); video_ok=video_compatible(ps)
-        local=[]
-        prep_mode='copy' if exact else 'audio' if video_ok else 'normalize'
-
+        local=[]; prep_mode='copy' if exact else 'audio' if video_ok else 'normalize'
         if exact:
-            local=raw
-            set_job(i,phase='Fast Mode: qualidade original',overall_percent=28)
+            local=raw; set_job(i,phase='Fast Mode: 4K original sem recodificar',overall_percent=28)
         else:
             done=0
             for si,arr in enumerate(raw):
                 out=[]
                 for fi,item in enumerate(arr):
                     if prep_mode=='audio':
-                        phase=f'Ajustando áudio {done+1}/{n}'
-                        pct=20+round(done/max(n,1)*18,1)
+                        phase=f'Preservando 4K e ajustando áudio {done+1}/{n}'; pct=20+round(done/max(n,1)*18,1)
                     else:
-                        q=PROFILES.get(quality,PROFILES['high'])
-                        phase=f"Preparando {q['label']} {done+1}/{n}"
-                        pct=20+round(done/max(n,1)*30,1)
+                        q=PROFILES.get(quality,PROFILES['camera4k']); phase=f"Preparando {q['label']} {done+1}/{n}"; pct=20+round(done/max(n,1)*30,1)
                     set_job(i,phase=phase,overall_percent=pct)
                     dst=prepared/f's{si:02d}_f{fi:03d}.mp4'
-                    if prep_mode=='audio': normalize_audio_only(item['path'],dst)
-                    else: normalize(item['path'],dst,quality)
-                    out.append({**item,'path':dst})
-                    item['path'].unlink(missing_ok=True); done+=1
+                    if prep_mode=='audio': normalize_audio_only(item['path'],dst,quality)
+                    else: normalize(item['path'],dst,quality,reference)
+                    out.append({**item,'path':dst}); item['path'].unlink(missing_ok=True); done+=1
                 local.append(out)
             set_job(i,phase='Preparação concluída',overall_percent=40 if prep_mode=='audio' else 50)
-
         total_available=1
         for a in local: total_available*=len(a)
         if mode=='random':
-            wanted=min(max(1,requested),total_available)
-            indices=random.Random(i).sample(range(total_available),wanted)
-            selected=[]
-            sizes=[len(a) for a in local]
+            wanted=min(max(1,requested),total_available); indices=random.Random(i).sample(range(total_available),wanted); selected=[]; sizes=[len(a) for a in local]
             for idx in indices:
                 pick=[]
-                for a,size in zip(reversed(local),reversed(sizes)):
-                    pick.append(a[idx%size]); idx//=size
+                for a,size in zip(reversed(local),reversed(sizes)): pick.append(a[idx%size]); idx//=size
                 selected.append(tuple(reversed(pick)))
         else:
             if total_available>MAX_COMBINATIONS:raise RuntimeError(f'Este worker aceita no máximo {MAX_COMBINATIONS} combinações por job.')
             selected=itertools.product(*local)
-
         count=min(requested,total_available) if mode=='random' else total_available
         base=28 if exact else 40 if prep_mode=='audio' else 50
         set_job(i,total=count,progress=0,phase='Gerando combinações',overall_percent=base)
         zp=wd/'VideoLabs-resultados.zip'; seen={}
-        manifest={'project':j['project_name'],'mode':mode,'quality':quality,'preparation_mode':prep_mode,'total_available':total_available,'generated':count,'stages':[{'name':s['name'],'files':[{'name':f['name'],'label':f.get('label')} for f in s['files']]} for s in stages],'outputs':[]}
+        manifest={'project':j['project_name'],'mode':mode,'quality':quality,'preparation_mode':prep_mode,'reference_resolution':f'{reference[1]}x{reference[2]}' if reference else None,'total_available':total_available,'generated':count,'stages':[{'name':s['name'],'files':[{'name':f['name'],'label':f.get('label')} for f in s['files']]} for s in stages],'outputs':[]}
         with zipfile.ZipFile(zp,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as z:
             for x,c in enumerate(selected,1):
-                filename=output_name(c,seen); out=wd/filename
-                concat(c,out); z.write(out,arcname=out.name)
-                manifest['outputs'].append({'file':out.name,'sources':[{'label':item['label'],'original':item['original_name']} for item in c]})
-                out.unlink(missing_ok=True)
+                filename=output_name(c,seen); out=wd/filename; concat(c,out); z.write(out,arcname=out.name)
+                manifest['outputs'].append({'file':out.name,'sources':[{'label':item['label'],'original':item['original_name']} for item in c]}); out.unlink(missing_ok=True)
                 set_job(i,progress=x,phase=f'Gerando {x}/{count}',overall_percent=base+round(x/max(count,1)*(100-base),1))
             z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
-
         shutil.rmtree(inputs,ignore_errors=True); shutil.rmtree(prepared,ignore_errors=True)
         set_job(i,status='ready',phase='Pronto para baixar',progress=count,overall_percent=100,zip_path=str(zp))
     except Exception as e:
@@ -217,8 +212,7 @@ def recover_interrupted():
             j['workdir']=str(p.parent)
             with lock:jobs[i]=j
             if j.get('status') in ('queued','processing'):
-                set_job(i,status='queued',phase='Retomando após reinício do worker',overall_percent=0,error=None)
-                executor.submit(process_job,i)
+                set_job(i,status='queued',phase='Retomando após reinício do worker',overall_percent=0,error=None); executor.submit(process_job,i)
         except Exception:continue
 
 def cleanup():
@@ -233,9 +227,9 @@ def cleanup():
 recover_interrupted(); threading.Thread(target=cleanup,daemon=True).start()
 
 @app.get('/')
-def root():return {'name':APP_NAME,'status':'ok','version':'0.6.0'}
+def root():return {'name':APP_NAME,'status':'ok','version':'0.7.0'}
 @app.get('/health')
-def health():return {'ok':True,'ffmpeg':Path(FFMPEG).name,'version':'0.6.0','profiles':PROFILES}
+def health():return {'ok':True,'ffmpeg':Path(FFMPEG).name,'version':'0.7.0','profiles':PROFILES,'copy_codecs':COPY_CODECS}
 @app.post('/v1/jobs/remote')
 async def create_remote(request:Request):
     m=await request.json(); stages=m.get('stages') or []
@@ -246,8 +240,8 @@ async def create_remote(request:Request):
             if not str(f.get('url','')).startswith('https://res.cloudinary.com/sskapqzv/'):raise HTTPException(400,'Origem de vídeo não permitida.')
     total=1
     for s in stages:total*=len(s['files'])
-    mode=m.get('mode','all'); requested=int(m.get('requested',25)); quality=m.get('quality','high')
-    if quality not in PROFILES:quality='high'
+    mode=m.get('mode','all'); requested=int(m.get('requested',25)); quality=m.get('quality','camera4k')
+    if quality not in PROFILES:quality='camera4k'
     if mode=='all' and total>MAX_COMBINATIONS:raise HTTPException(400,f'Há {total} combinações. O limite é {MAX_COMBINATIONS}.')
     i=uuid.uuid4().hex[:12]; wd=ROOT/i; wd.mkdir(parents=True,exist_ok=True)
     with lock:jobs[i]={'status':'queued','phase':'Na fila','progress':0,'total':total if mode=='all' else min(requested,total),'overall_percent':0,'error':None,'created_at':time.time(),'workdir':str(wd),'stages':stages,'mode':mode,'requested':requested,'quality':quality,'project_name':safe_name(m.get('projectName','Projeto VideoLabs'))}
