@@ -64,8 +64,8 @@ def run(args):
 
 def probe(p):
     r=subprocess.run([FFMPEG,'-hide_banner','-threads','1','-i',str(p)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True).stderr
-    v=re.search(r'Video:\s*([^,]+).*?,\s*(\d{2,5})x(\d{2,5}).*?(\d+(?:\.\d+)?) fps',r); a=re.search(r'Audio:\s*([^,]+),\s*(\d+) Hz',r)
-    return (v.group(1).strip() if v else '',int(v.group(2)) if v else 0,int(v.group(3)) if v else 0,round(float(v.group(4)),2) if v else 0,a.group(1).strip() if a else '',int(a.group(2)) if a else 0,bool(a))
+    v=re.search(r'Video:\s*([a-zA-Z0-9_]+).*?,\s*(\d{2,5})x(\d{2,5}).*?(\d+(?:\.\d+)?) fps',r); a=re.search(r'Audio:\s*([a-zA-Z0-9_]+).*?,\s*(\d+) Hz',r)
+    return (v.group(1).lower() if v else '',int(v.group(2)) if v else 0,int(v.group(3)) if v else 0,round(float(v.group(4)),2) if v else 0,a.group(1).lower() if a else '',int(a.group(2)) if a else 0,bool(a))
 
 def exact_compatible(ps):
     if not ps or any(not p[0] for p in ps):return False
